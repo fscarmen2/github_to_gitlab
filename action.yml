@@ -1,11 +1,6 @@
 name: "GitHub to GitLab Repository Sync"
 description: "This GitHub Action syncs repositories from GitHub to GitLab, ensuring that the latest changes from GitHub are reflected in corresponding GitLab repositories."
 author: "fscarmen2"
-inputs:
-  config_path:
-    description: "Path to the configuration YAML file."
-    required: true
-    default: "./config.yml"
 outputs:
   result:
         description: "A summary of the sync operation, including which repositories were updated and which were skipped."
@@ -17,17 +12,31 @@ runs:
       run: |
         echo "开始从 GitHub 主库克隆到 GitLab 备份库"
 
-        # 读取配置，为防止用户在 : 后面没有加空格导致 yq 出错，故用 sed 处理强制在 : 后加上空格
-        CONFIG=$(sed 's/:/: /g; s/:[[:space:]]\+/: /g' "${{ inputs.config_path }}")
-        GITHUB_TOKEN=$(yq eval '.github_pat' <<< "$CONFIG")
-        GITLAB_USERNAME=$(yq eval '.gitlab_username' <<< "$CONFIG")
-        GITHUB_REPO_PREFIX=$(yq eval '.github_repo_prefix' <<< "$CONFIG")
-        GITLAB_REPO_PREFIX=$(yq eval '.gitlab_repo_prefix' <<< "$CONFIG")
-        GITLAB_REPO_SUFFIX=($(yq eval '.gitlab_pats | keys | .[]' <<< "$CONFIG"))
+        # 从 Action runner 的 env 环境变量获取 ACCOUNT_ID, WORKER_NAME 和 API_TOKEN
+        ACCOUNT_ID="${{ env.ACCOUNT_ID }}"
+        WORKER_NAME="${{ env.WORKER_NAME }}"
+        API_TOKEN="${{ env.API_TOKEN }}"
 
-        # GitHub 仓库所有者
-        GITHUB_OWNER=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-                       "https://api.github.com/user" | jq -r .login)
+        [ -z "$ACCOUNT_ID" ] && SECRET+=(ACCOUNT_ID)
+        [ -z "$WORKER_NAME" ] && SECRET+=(WORKER_NAME)
+        [ -z "$API_TOKEN" ] && SECRET+=(API_TOKEN)
+        [ "${#SECRET[@]}" != '0' ] && echo "Secret 里缺少变量 ${SECRET[@]}，请检测！" && exit 1
+
+        # 获取 worker 包含账户信息的内容
+        WORKER=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/scripts/$WORKER_NAME" \
+             -H "Authorization: Bearer $API_TOKEN" \
+             -H "Content-Type: application/json" | sed -n '/name="worker.js"/,/async function getSignedUrl/p')
+
+        # 获取 GitLab 账户信息
+        GITLAB_REPO=($(sed -n '/const GITLAB_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "name:\s*'\K[^']+"))
+        GITLAB_ID=($(sed -n '/const GITLAB_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "id:\s*'\K[^']+"))
+        GITLAB_TOKEN=($(sed -n '/const GITLAB_CONFIGS = \[/,/\];/p' <<< "$WORKER" | grep -oP "token:\s*'\K[^']+"))
+        GITLAB_USERNAME=$(curl --silent --header "PRIVATE-TOKEN: ${GITLAB_TOKEN[0]}" "https://gitlab.com/api/v4/projects/${GITLAB_ID[0]}" | jq -r '.namespace.path')
+
+        # 获取 GitHub 账户信息
+        GITHUB_REPO=(${GITLAB_REPO[@]})
+        GITHUB_TOKEN=$(sed -n "s/^const GITHUB_PAT = '\(.*\)'.*/\1/gp" <<< "$WORKER")
+        GITHUB_USERNAME=$(sed -n "s/^const GITHUB_USERNAME = '\(.*\)'.*/\1/gp" <<< "$WORKER")
 
         # 初始化更新和未更新仓库的数组
         UPDATED_REPOS=()
@@ -36,56 +45,51 @@ runs:
         # 同步函数
         sync_repo() {
           local i=$1
-          local GITHUB_REPO="${GITHUB_REPO_PREFIX}${i}"
-          local GITLAB_REPO="${GITLAB_REPO_PREFIX}${i}"
           echo "================================="
-          echo "同步 GitHub: $GITHUB_REPO --→ GitLab: $GITLAB_REPO"
+          echo "同步 GitHub: ${GITHUB_REPO[i]} --→ GitLab: ${GITLAB_REPO[i]}"
 
           # 获取 GitHub 仓库的最新 commit SHA
           local GITHUB_SHA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-                         "https://api.github.com/repos/$GITHUB_OWNER/${GITHUB_REPO}/commits/main" | \
+                         "https://api.github.com/repos/$GITHUB_USERNAME/${GITHUB_REPO[i]}/commits/main" | \
                          jq -r .sha)
 
         # 如果 GitHub SHA 为 null，跳过这个仓库
         if [ "$GITHUB_SHA" = "null" ]; then
-            echo "GitHub 仓库 ${GITHUB_REPO} 未找到或为空，跳过"
-            NOT_UPDATED_REPOS+=("$GITHUB_REPO")
+            echo "GitHub 仓库 ${GITHUB_REPO[i]} 未找到或为空，跳过"
+            NOT_UPDATED_REPOS+=("${GITHUB_REPO[i]}")
             return
         fi
 
-        # 获取对应的 GitLab PAT
-        local PAT=$(yq eval ".gitlab_pats.\"$i\"" <<< "$CONFIG")
-
         # 获取 GitLab 仓库的最新 commit SHA
-        local GITLAB_SHA=$(curl -s -H "PRIVATE-TOKEN: $PAT" \
-                       "https://gitlab.com/api/v4/projects/${GITLAB_USERNAME}%2F${GITLAB_REPO}/repository/branches/main" | \
+        local GITLAB_SHA=$(curl -s -H "PRIVATE-TOKEN: ${GITLAB_TOKEN[i]}" \
+                       "https://gitlab.com/api/v4/projects/${GITLAB_USERNAME}%2F${GITLAB_REPO[i]}/repository/branches/main" | \
                        jq -r .commit.id)
 
         # 如果 SHA 不同，则进行同步
         if [ "$GITHUB_SHA" != "$GITLAB_SHA" ]; then
-            echo "GitHub: ${GITHUB_REPO} 有更新，同步中"
+            echo "GitHub: ${GITHUB_REPO[i]} 有更新，同步中"
 
             # 克隆 GitHub 仓库
-            git clone https://${GITHUB_OWNER}:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git
-            cd ${GITHUB_REPO}
+            git clone https://${GITHUB_USERNAME}:${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${GITHUB_REPO[i]}.git
+            cd ${GITHUB_REPO[i]}
 
             # 设置 GitLab 远程仓库并强制推送
-            git remote add gitlab https://${GITLAB_USERNAME}:${PAT}@gitlab.com/${GITLAB_USERNAME}/${GITLAB_REPO}.git
+            git remote add gitlab https://${GITLAB_USERNAME}:${GITLAB_TOKEN[i]}@gitlab.com/${GITLAB_USERNAME}/${GITLAB_REPO[i]}.git
             git push -f gitlab main
 
             cd ..
-            rm -rf ${GITHUB_REPO}
+            rm -rf ${GITHUB_REPO[i]}
 
-            echo "已同步 ${GITHUB_REPO} 到 GitLab ${GITLAB_REPO}"
-            UPDATED_REPOS+=("$GITHUB_REPO")
+            echo "已同步 ${GITHUB_REPO[i]} 到 GitLab ${GITLAB_REPO[i]}"
+            UPDATED_REPOS+=("${GITHUB_REPO[i]}")
         else
-            echo "${GITHUB_REPO} 无变化，跳过"
-            NOT_UPDATED_REPOS+=("$GITHUB_REPO")
+            echo "${GITHUB_REPO[i]} 无变化，跳过"
+            NOT_UPDATED_REPOS+=("${GITHUB_REPO[i]}")
           fi
         }
 
         # 主循环
-        for i in "${GITLAB_REPO_SUFFIX[@]}"; do
+        for i in "${!GITLAB_REPO[@]}"; do
             sync_repo $i
         done
 
